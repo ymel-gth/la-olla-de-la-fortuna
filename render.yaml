@@ -1,0 +1,7 @@
+services:
+  - type: web
+    name: la-olla-de-la-fortuna
+    runtime: node
+    buildCommand: npm install
+    startCommand: npm start
+    healthCheckPath: /health
