@@ -1,296 +1,67 @@
-const path = require("path");
-const http = require("http");
-const express = require("express");
-const { Server } = require("socket.io");
+const path = require('path');
+const http = require('http');
+const crypto = require('crypto');
+const express = require('express');
+const { Server } = require('socket.io');
 
 const app = express();
 const server = http.createServer(app);
-const io = new Server(server);
+const io = new Server(server, { pingInterval: 25000, pingTimeout: 20000 });
+const PORT = process.env.PORT || 10000;
+app.use(express.json({ limit: '2mb' }));
+app.use(express.static(path.join(__dirname, 'public')));
 
-const PORT = process.env.PORT || 3000;
-app.use(express.json({ limit: "2mb" }));
-app.use(express.static(path.join(__dirname, "public")));
-
-app.get("/health", (_req, res) => res.json({ ok: true, app: "La Olla de la Fortuna V2" }));
-
+const MIN_TEAMS = 2, MAX_TEAMS = 10;
 const rooms = new Map();
-const MIN_TEAMS = 2;
-const MAX_TEAMS = 10;
-
 const DEFAULT_LOTS = [
-  { id:"L1", icon:"🧠", category:"Salud", name:"Salud mental y manejo del estrés", description:"Acciones de prevención, acompañamiento y manejo saludable del estrés laboral.", start:15000, impact:5, priority:"Alta" },
-  { id:"L2", icon:"🏃", category:"Salud", name:"Actividad física y hábitos saludables", description:"Programas que promueven movimiento, pausas activas y hábitos de vida saludable.", start:10000, impact:4, priority:"Alta" },
-  { id:"L3", icon:"👨‍👩‍👧‍👦", category:"Familia", name:"Integración familiar", description:"Actividades que fortalecen la conciliación, integración y participación de las familias.", start:8000, impact:3, priority:"Media" },
-  { id:"L4", icon:"💬", category:"Desarrollo", name:"Competencias socioemocionales", description:"Formación en comunicación, empatía, resolución de conflictos y autorregulación.", start:12000, impact:5, priority:"Alta" },
-  { id:"L5", icon:"🌿", category:"Descanso", name:"Descanso y recuperación", description:"Iniciativas orientadas a recuperación, desconexión y equilibrio entre vida y trabajo.", start:7000, impact:4, priority:"Media" },
-  { id:"L6", icon:"🏆", category:"Reconocimiento", name:"Reconocimiento al desempeño", description:"Estrategias de reconocimiento y valoración de los aportes de las personas.", start:9000, impact:3, priority:"Media" }
+ {id:'L1',icon:'🧠',category:'Salud',name:'Salud mental y manejo del estrés',description:'Acciones de prevención, acompañamiento y manejo saludable del estrés laboral.',start:15000,impact:5,priority:'Alta'},
+ {id:'L2',icon:'🏃',category:'Salud',name:'Actividad física y hábitos saludables',description:'Programas que promueven movimiento, pausas activas y hábitos de vida saludable.',start:10000,impact:4,priority:'Alta'},
+ {id:'L3',icon:'👨‍👩‍👧‍👦',category:'Familia',name:'Integración familiar',description:'Actividades que fortalecen la conciliación, integración y participación de las familias.',start:8000,impact:3,priority:'Media'},
+ {id:'L4',icon:'💬',category:'Desarrollo',name:'Competencias socioemocionales',description:'Formación en comunicación, empatía, resolución de conflictos y autorregulación.',start:12000,impact:5,priority:'Alta'},
+ {id:'L5',icon:'🌿',category:'Descanso',name:'Descanso y recuperación',description:'Iniciativas orientadas a recuperación, desconexión y equilibrio entre vida y trabajo.',start:7000,impact:4,priority:'Media'},
+ {id:'L6',icon:'🏆',category:'Reconocimiento',name:'Reconocimiento al desempeño',description:'Estrategias de reconocimiento y valoración de los aportes de las personas.',start:9000,impact:3,priority:'Media'}
 ];
-
-function cleanText(v, max = 2000) {
-  return String(v ?? "").replace(/[<>]/g, "").trim().slice(0, max);
+function clean(v,max=4000){return String(v??'').replace(/[<>]/g,'').trim().slice(0,max)}
+function code(n=6){const c='ABCDEFGHJKLMNPQRSTUVWXYZ23456789';let s='';for(let i=0;i<n;i++)s+=c[Math.floor(Math.random()*c.length)];return s}
+function uniqueCode(map,n=6){let c;do{c=code(n)}while(map.has(c));return c}
+function normalizeLots(lots){return (Array.isArray(lots)&&lots.length?lots:DEFAULT_LOTS).map((x,i)=>({id:clean(x.id||`L${i+1}`,20),icon:clean(x.icon||'🎯',8),category:clean(x.category||'Bienestar',60),name:clean(x.name||`Necesidad ${i+1}`,120),description:clean(x.description||'',1000),start:Math.max(1,Number(x.start)||1),impact:Math.min(5,Math.max(1,Number(x.impact)||3)),priority:['Alta','Media','Baja'].includes(x.priority)?x.priority:'Media'}))}
+function teamCode(){return code(6)}
+function makeTeam(def,budget){return {id:crypto.randomUUID(),name:clean(def.name,60),code:clean(def.code||teamCode(),12).toUpperCase(),balance:budget,invested:0,wins:0,authenticated:false,connected:false,socketId:null,needs:[],reflections:[]}}
+function createRoom(socket,setup={}){
+ const teams=(Array.isArray(setup.teams)?setup.teams:[]).slice(0,MAX_TEAMS);
+ const r={code:code(),sessionToken:crypto.randomBytes(18).toString('hex'),instructorId:socket.id,activityName:clean(setup.activityName||'La Olla de la Fortuna',100),budget:Math.max(1,Number(setup.budget)||100000),minIncrement:Math.max(1,Number(setup.minIncrement)||1000),lotDuration:Math.max(15,Number(setup.lotDuration)||60),noConsecutive:!!setup.noConsecutive,teams:[],lots:normalizeLots(setup.lots),phase:'lobby',currentLot:-1,currentBid:0,currentBidderId:null,bids:[],lotEndsAt:null,timer:null,pendingJustification:null,awarded:[],createdAt:Date.now(),lastSnapshot:Date.now()};
+ const seen=new Set(); teams.forEach(d=>{let c=String(d.code||'').trim().toUpperCase()||teamCode();while(seen.has(c))c=teamCode();seen.add(c);r.teams.push(makeTeam({...d,code:c},r.budget))});
+ rooms.set(r.code,r); socket.join(r.code); return r;
 }
-function roomCode() {
-  const chars = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
-  let s = "";
-  for (let i=0;i<6;i++) s += chars[Math.floor(Math.random()*chars.length)];
-  return s;
-}
-function teamCode() {
-  return Math.random().toString(36).slice(2, 8).toUpperCase();
-}
-function now() { return Date.now(); }
+function publicTeam(t){return {id:t.id,name:t.name,code:t.code,balance:t.balance,invested:t.invested,wins:t.wins,authenticated:t.authenticated,connected:t.connected,needs:t.needs.map(n=>({...n})) ,reflections:t.reflections||[]}}
+function publicState(r){const lot=r.lots[r.currentLot]||null;return {code:r.code,sessionToken:r.sessionToken,activityName:r.activityName,budget:r.budget,minIncrement:r.minIncrement,lotDuration:r.lotDuration,noConsecutive:r.noConsecutive,teams:r.teams.map(publicTeam),lots:r.lots,phase:r.phase,currentLot:r.currentLot,currentBid:r.currentBid,currentBidderId:r.currentBidderId,currentBidderName:r.teams.find(t=>t.id===r.currentBidderId)?.name||null,bids:r.bids.slice(-50),lotEndsAt:r.lotEndsAt,pendingJustification:r.pendingJustification?{teamId:r.pendingJustification.teamId,lotId:r.pendingJustification.lotId,deadline:r.pendingJustification.deadline}:null,awarded:r.awarded,allAuthenticated:r.teams.length>=MIN_TEAMS&&r.teams.every(t=>t.authenticated),currentLotData:lot}}
+function snapshot(r){const s=publicState(r);s._private={instructorToken:r.sessionToken};return s}
+function emitState(r){io.to(r.code).emit('state',publicState(r));r.lastSnapshot=Date.now()}
+function clearRoomTimer(r){if(r.timer){clearTimeout(r.timer);r.timer=null}}
+function awardAndJustify(r){if(r.phase!=='auction')return;clearRoomTimer(r);r.lotEndsAt=null;const lot=r.lots[r.currentLot],winner=r.teams.find(t=>t.id===r.currentBidderId);if(!winner||r.currentBid<lot.start){r.phase='between';emitState(r);return}const n={lotId:lot.id,name:lot.name,value:r.currentBid,justification:'',justificationAt:null};winner.needs.push(n);winner.invested+=r.currentBid;winner.balance-=r.currentBid;winner.wins++;r.awarded.push({lotId:lot.id,lotName:lot.name,teamId:winner.id,teamName:winner.name,value:r.currentBid,justification:'',awardedAt:Date.now()});r.phase='justification';r.pendingJustification={teamId:winner.id,lotId:lot.id,startedAt:Date.now(),deadline:Date.now()+60000};emitState(r);io.to(r.code).emit('justificationStart',{teamId:winner.id,teamName:winner.name,lotId:lot.id,deadline:r.pendingJustification.deadline});r.timer=setTimeout(()=>autoCloseJustification(r),60000)}
+function autoCloseJustification(r){if(r.phase!=='justification'||!r.pendingJustification)return;const p=r.pendingJustification,t=r.teams.find(x=>x.id===p.teamId),n=t?.needs.find(x=>x.lotId===p.lotId);if(n){if(!n.justification)n.justification='(Sin justificación registrada dentro del tiempo)';n.justificationAt=Date.now();const a=r.awarded.find(x=>x.lotId===p.lotId&&x.teamId===p.teamId);if(a)a.justification=n.justification}r.pendingJustification=null;r.phase='between';clearRoomTimer(r);emitState(r)}
+function startLot(r){if(r.phase==='finished')return;const next=r.currentLot+1;if(next>=r.lots.length){r.phase='finished';r.currentLot=r.lots.length;clearRoomTimer(r);r.lotEndsAt=null;emitState(r);return}r.phase='auction';r.currentLot=next;r.currentBid=0;r.currentBidderId=null;r.bids=[];r.lotEndsAt=Date.now()+r.lotDuration*1000;emitState(r);clearRoomTimer(r);r.timer=setTimeout(()=>awardAndJustify(r),r.lotDuration*1000);io.to(r.code).emit('auctionStart',{lotId:r.lots[next].id,endsAt:r.lotEndsAt})}
+function restoreRoom(socket,data){if(!data||!data.code||!data.sessionToken)return null;const existing=rooms.get(String(data.code).toUpperCase());if(existing){existing.instructorId=socket.id;socket.join(existing.code);return existing}const s=data;const r={code:String(s.code).toUpperCase(),sessionToken:String(s.sessionToken),instructorId:socket.id,activityName:clean(s.activityName||'La Olla de la Fortuna',100),budget:Math.max(1,Number(s.budget)||100000),minIncrement:Math.max(1,Number(s.minIncrement)||1000),lotDuration:Math.max(15,Number(s.lotDuration)||60),noConsecutive:!!s.noConsecutive,teams:[],lots:normalizeLots(s.lots),phase:s.phase||'lobby',currentLot:Number.isInteger(s.currentLot)?s.currentLot:-1,currentBid:Number(s.currentBid)||0,currentBidderId:s.currentBidderId||null,bids:Array.isArray(s.bids)?s.bids.slice(-50):[],lotEndsAt:s.lotEndsAt||null,timer:null,pendingJustification:s.pendingJustification||null,awarded:Array.isArray(s.awarded)?s.awarded:[],createdAt:Date.now(),lastSnapshot:Date.now()};
+ (Array.isArray(s.teams)?s.teams:[]).slice(0,MAX_TEAMS).forEach(pt=>{const t=makeTeam({name:pt.name,code:pt.code},r.budget);t.id=pt.id||crypto.randomUUID();t.balance=Number(pt.balance)||r.budget;t.invested=Number(pt.invested)||0;t.wins=Number(pt.wins)||0;t.authenticated=!!pt.authenticated;t.connected=false;t.needs=Array.isArray(pt.needs)?pt.needs:[];t.reflections=Array.isArray(pt.reflections)?pt.reflections:[];r.teams.push(t)});
+ rooms.set(r.code,r);socket.join(r.code);return r}
+function teamRoom(code,teamCode){const r=rooms.get(String(code||'').toUpperCase().trim());if(!r)return [null,null];const t=r.teams.find(x=>x.code===String(teamCode||'').toUpperCase().trim());return [r,t]}
 
-function createRoom(socket, setup={}) {
-  let code = roomCode();
-  while (rooms.has(code)) code = roomCode();
-  const r = {
-    code,
-    instructorId: socket.id,
-    activityName: cleanText(setup.activityName || "La Olla de la Fortuna", 100),
-    budget: Math.max(1, Number(setup.budget) || 100000),
-    minIncrement: Math.max(1, Number(setup.minIncrement) || 1000),
-    lotDuration: Math.max(15, Number(setup.lotDuration) || 60),
-    noConsecutive: !!setup.noConsecutive,
-    teams: [],
-    lots: Array.isArray(setup.lots) && setup.lots.length ? normalizeLots(setup.lots) : structuredClone(DEFAULT_LOTS),
-    phase: "lobby",
-    currentLot: -1,
-    currentBid: 0,
-    currentBidderId: null,
-    bids: [],
-    lotEndsAt: null,
-    timer: null,
-    awarded: [],
-    createdAt: now()
-  };
-  rooms.set(code, r);
-  socket.join(code);
-  return r;
-}
-function normalizeLots(lots) {
-  return lots.map((x,i)=>({
-    id: cleanText(x.id || `L${i+1}`, 20),
-    icon: cleanText(x.icon || "🎯", 8),
-    category: cleanText(x.category || "Bienestar", 60),
-    name: cleanText(x.name || `Necesidad ${i+1}`, 120),
-    description: cleanText(x.description || "", 1000),
-    start: Math.max(1, Number(x.start) || 1),
-    impact: Math.min(5, Math.max(1, Number(x.impact) || 3)),
-    priority: ["Alta","Media","Baja"].includes(x.priority) ? x.priority : "Media"
-  }));
-}
-function teamPublic(t) {
-  return {
-    id:t.id, name:t.name, code:t.code, balance:t.balance, invested:t.invested,
-    wins:t.wins, authenticated:t.authenticated, connected:t.connected,
-    needs:t.needs.map(n=>({lotId:n.lotId,name:n.name,value:n.value,justification:n.justification,justificationAt:n.justificationAt}))
-  };
-}
-function publicState(r) {
-  const lot = r.lots[r.currentLot] || null;
-  return {
-    code:r.code, activityName:r.activityName, budget:r.budget,
-    minIncrement:r.minIncrement, lotDuration:r.lotDuration, noConsecutive:r.noConsecutive,
-    teams:r.teams.map(teamPublic),
-    lots:r.lots, phase:r.phase, currentLot:r.currentLot,
-    currentBid:r.currentBid, currentBidderId:r.currentBidderId,
-    currentBidderName:r.teams.find(t=>t.id===r.currentBidderId)?.name || null,
-    bids:r.bids.slice(-30), lotEndsAt:r.lotEndsAt,
-    awarded:r.awarded, allAuthenticated:r.teams.length>=MIN_TEAMS && r.teams.every(t=>t.authenticated),
-    currentLotData:lot
-  };
-}
-function emitState(r) { io.to(r.code).emit("state", publicState(r)); }
+app.get('/health',(_req,res)=>res.json({ok:true,app:'La Olla de la Fortuna V3',rooms:rooms.size}));
+app.get('/api/room/:code/export',(req,res)=>{const r=rooms.get(req.params.code.toUpperCase());if(!r)return res.status(404).send('Sala no encontrada');const rows=[['Equipo','Código','Necesidad','Valor adjudicado','Saldo final','% presupuesto usado','Justificación','Reflexiones']];r.teams.forEach(t=>{const pct=r.budget?((t.invested/r.budget)*100).toFixed(2):'0.00';if(!t.needs.length)rows.push([t.name,t.code,'','',t.balance,pct,'',(t.reflections||[]).join(' | ')]);else t.needs.forEach(n=>rows.push([t.name,t.code,n.name,n.value,t.balance,pct,n.justification,(t.reflections||[]).join(' | ')]))});const esc=v=>`"${String(v??'').replace(/"/g,'""')}"`;res.setHeader('Content-Type','text/csv; charset=utf-8');res.setHeader('Content-Disposition',`attachment; filename="olla_fortuna_${r.code}.csv"`);res.send('\ufeff'+rows.map(row=>row.map(esc).join(',')).join('\n'))});
 
-function finishLot(r, reason="timer") {
-  if (r.phase !== "auction") return;
-  const lot = r.lots[r.currentLot];
-  if (!lot) return;
-  clearTimeout(r.timer); r.timer = null; r.lotEndsAt = null;
-
-  const winner = r.teams.find(t=>t.id===r.currentBidderId);
-  if (winner && r.currentBid >= lot.start) {
-    const need = { lotId:lot.id, name:lot.name, value:r.currentBid, justification:"", justificationAt:null };
-    winner.needs.push(need);
-    winner.invested += r.currentBid;
-    winner.balance -= r.currentBid;
-    winner.wins += 1;
-    r.awarded.push({ lotId:lot.id, lotName:lot.name, teamId:winner.id, teamName:winner.name, value:r.currentBid, justification:"", awardedAt:now() });
-    r.phase = "justification";
-    r.pendingJustification = { teamId:winner.id, lotId:lot.id, startedAt:now(), deadline:now()+60000 };
-    emitState(r);
-    io.to(r.code).emit("justificationStart", { teamId:winner.id, teamName:winner.name, lotId:lot.id, deadline:r.pendingJustification.deadline });
-    r.timer = setTimeout(()=>autoCloseJustification(r), 60000);
-  } else {
-    r.phase = "between";
-    emitState(r);
-  }
-}
-function autoCloseJustification(r) {
-  if (r.phase !== "justification" || !r.pendingJustification) return;
-  const p = r.pendingJustification;
-  const team = r.teams.find(t=>t.id===p.teamId);
-  const need = team?.needs.find(n=>n.lotId===p.lotId);
-  if (need) {
-    need.justification = need.justification || "(Sin justificación registrada dentro del tiempo)";
-    need.justificationAt = now();
-    const a = r.awarded.find(x=>x.lotId===p.lotId && x.teamId===p.teamId && !x.justification);
-    if (a) a.justification = need.justification;
-  }
-  r.pendingJustification = null; r.timer = null;
-  r.phase = "between"; emitState(r);
-}
-function startNextLot(r) {
-  if (r.phase === "finished") return;
-  const next = r.currentLot + 1;
-  if (next >= r.lots.length) {
-    r.phase = "finished"; r.currentLot = r.lots.length;
-    clearTimeout(r.timer); r.timer=null; r.lotEndsAt=null; emitState(r); return;
-  }
-  r.phase = "auction"; r.currentLot = next; r.currentBid = 0; r.currentBidderId = null; r.bids = [];
-  r.lotEndsAt = now() + r.lotDuration*1000;
-  emitState(r);
-  clearTimeout(r.timer);
-  r.timer = setTimeout(()=>finishLot(r,"timer"), r.lotDuration*1000);
-  io.to(r.code).emit("auctionStart", {lotId:r.lots[next].id, endsAt:r.lotEndsAt});
-}
-
-io.on("connection", socket => {
-  socket.on("createRoom", setup => {
-    const r = createRoom(socket, setup || {});
-    socket.data.role="instructor"; socket.data.room=r.code;
-    socket.emit("roomCreated", {code:r.code, instructorId:r.instructorId});
-    emitState(r);
-  });
-
-  socket.on("joinRoom", ({code,name,teamCode}) => {
-    const r=rooms.get(String(code||"").toUpperCase().trim());
-    if (!r) return socket.emit("errorMsg","No existe esa sala.");
-    if (r.phase!=="lobby") return socket.emit("errorMsg","La sala ya inició la simulación.");
-    name=cleanText(name,60);
-    if (!name) return socket.emit("errorMsg","Escribe el nombre del equipo.");
-    let t = r.teams.find(x=>x.code===String(teamCode||"").toUpperCase());
-    if (!t) {
-      if (r.teams.length>=MAX_TEAMS) return socket.emit("errorMsg","La sala ya tiene el máximo de 10 equipos.");
-      t={id:teamCode(),name,code:teamCode(),balance:r.budget,invested:0,wins:0,authenticated:true,connected:true,socketId:socket.id,needs:[],reflections:[]};
-      r.teams.push(t);
-    } else {
-      if (t.name!==name) return socket.emit("errorMsg","El código de equipo no corresponde a ese nombre.");
-      t.connected=true; t.socketId=socket.id; t.authenticated=true;
-    }
-    socket.data.role="team"; socket.data.room=r.code; socket.data.teamId=t.id;
-    socket.join(r.code); socket.emit("joined",{team:teamPublic(t), teamCode:t.code});
-    emitState(r);
-  });
-
-  socket.on("reconnectTeam", ({code,teamCode,name})=>{
-    const r=rooms.get(String(code||"").toUpperCase().trim());
-    const t=r?.teams.find(x=>x.code===String(teamCode||"").toUpperCase() && x.name===name);
-    if (!r || !t) return socket.emit("errorMsg","No fue posible reconectar el equipo.");
-    t.connected=true; t.socketId=socket.id; t.authenticated=true;
-    socket.data.role="team"; socket.data.room=r.code; socket.data.teamId=t.id; socket.join(r.code);
-    socket.emit("joined",{team:teamPublic(t),teamCode:t.code}); emitState(r);
-  });
-
-  socket.on("configure", setup=>{
-    const r=rooms.get(socket.data.room); if(!r || socket.data.role!=="instructor") return;
-    if(r.phase!=="lobby") return socket.emit("errorMsg","No se puede configurar después de iniciar.");
-    r.activityName=cleanText(setup.activityName||r.activityName,100);
-    r.budget=Math.max(1,Number(setup.budget)||r.budget);
-    r.minIncrement=Math.max(1,Number(setup.minIncrement)||r.minIncrement);
-    r.lotDuration=Math.max(15,Number(setup.lotDuration)||r.lotDuration);
-    r.noConsecutive=!!setup.noConsecutive;
-    r.lots=normalizeLots(setup.lots||r.lots);
-    r.teams.forEach(t=>{t.balance=r.budget;t.invested=0;t.wins=0;t.needs=[];t.reflections=[];});
-    emitState(r);
-  });
-
-  socket.on("start",()=>{
-    const r=rooms.get(socket.data.room); if(!r || socket.data.role!=="instructor") return;
-    if(r.teams.length<MIN_TEAMS || !r.teams.every(t=>t.authenticated)) return socket.emit("errorMsg","Se requieren mínimo 2 equipos y todos deben estar autenticados.");
-    r.currentLot=-1; r.phase="between"; emitState(r); startNextLot(r);
-  });
-
-  socket.on("nextLot",()=>{
-    const r=rooms.get(socket.data.room); if(!r || socket.data.role!=="instructor") return;
-    if(r.phase==="justification") return socket.emit("errorMsg","Espera o cierra la justificación.");
-    if(r.phase==="between" || r.phase==="lobby") startNextLot(r);
-  });
-
-  socket.on("placeBid",({amount})=>{
-    const r=rooms.get(socket.data.room); if(!r || socket.data.role!=="team" || r.phase!=="auction") return;
-    const t=r.teams.find(x=>x.id===socket.data.teamId); const lot=r.lots[r.currentLot];
-    if(!t || !lot) return;
-    const value=Number(amount);
-    const min=r.currentBid ? r.currentBid+r.minIncrement : lot.start;
-    if(!Number.isFinite(value) || value<min) return socket.emit("errorMsg",`La puja mínima válida es ${min.toLocaleString("es-CO")}.`);
-    if(value>t.balance) return socket.emit("errorMsg","No puedes pujar por encima de tu saldo disponible.");
-    if(r.noConsecutive && r.currentBidderId===t.id) return socket.emit("errorMsg","No se permiten pujas consecutivas de un mismo equipo.");
-    r.currentBid=value; r.currentBidderId=t.id;
-    r.bids.push({teamId:t.id,teamName:t.name,amount:value,at:now()});
-    emitState(r);
-  });
-
-  socket.on("endLot",()=>{
-    const r=rooms.get(socket.data.room); if(!r || socket.data.role!=="instructor") return;
-    finishLot(r,"manual");
-  });
-
-  socket.on("saveJustification",({text})=>{
-    const r=rooms.get(socket.data.room); if(!r || socket.data.role!=="team" || r.phase!=="justification") return;
-    const p=r.pendingJustification;
-    if(!p || p.teamId!==socket.data.teamId) return socket.emit("errorMsg","Este equipo no tiene una justificación pendiente.");
-    const t=r.teams.find(x=>x.id===p.teamId); const n=t?.needs.find(x=>x.lotId===p.lotId);
-    if(!n) return;
-    n.justification=String(text??"").trim(); n.justificationAt=now();
-    const a=r.awarded.find(x=>x.lotId===p.lotId && x.teamId===p.teamId);
-    if(a) a.justification=n.justification;
-    clearTimeout(r.timer); r.timer=null; r.pendingJustification=null; r.phase="between";
-    emitState(r); socket.emit("justificationSaved");
-  });
-
-  socket.on("saveReflections",({reflections})=>{
-    const r=rooms.get(socket.data.room); if(!r || socket.data.role!=="team") return;
-    const t=r.teams.find(x=>x.id===socket.data.teamId); if(!t) return;
-    t.reflections=Array.isArray(reflections)?reflections.map(x=>cleanText(x,4000)):[];
-    emitState(r);
-  });
-
-  socket.on("finishSimulation",()=>{
-    const r=rooms.get(socket.data.room); if(!r || socket.data.role!=="instructor") return;
-    if(r.phase==="justification") return socket.emit("errorMsg","Aún hay una justificación pendiente.");
-    clearTimeout(r.timer); r.timer=null; r.lotEndsAt=null; r.phase="finished"; emitState(r);
-  });
-
-  socket.on("disconnect",()=>{
-    const code=socket.data.room, r=rooms.get(code);
-    if(!r) return;
-    if(socket.data.role==="team"){
-      const t=r.teams.find(x=>x.id===socket.data.teamId);
-      if(t) t.connected=false;
-      emitState(r);
-    }
-  });
+io.on('connection',socket=>{
+ socket.on('createRoom',setup=>{const r=createRoom(socket,setup||{});socket.data={role:'instructor',room:r.code,token:r.sessionToken};socket.emit('roomCreated',{code:r.code,sessionToken:r.sessionToken});emitState(r)});
+ socket.on('restoreInstructor',(data)=>{const r=restoreRoom(socket,data);if(!r)return socket.emit('errorMsg','No se pudo recuperar la sesión de instructora.');socket.data={role:'instructor',room:r.code,token:r.sessionToken};socket.emit('roomRestored',{code:r.code,sessionToken:r.sessionToken});emitState(r)});
+ socket.on('joinTeam',({code,teamCode})=>{const [r,t]=teamRoom(code,teamCode);if(!r)return socket.emit('errorMsg','No existe esa sala. Pide a la instructora verificar que la actividad esté abierta.');if(!t)return socket.emit('errorMsg','Código de equipo no válido.');if(r.phase==='finished')return socket.emit('errorMsg','La simulación ya finalizó.');t.authenticated=true;t.connected=true;t.socketId=socket.id;socket.data={role:'team',room:r.code,teamId:t.id};socket.join(r.code);socket.emit('teamJoined',{team:publicTeam(t)});emitState(r)});
+ socket.on('configureTeams',({teams})=>{const r=rooms.get(socket.data.room);if(!r||socket.data.role!=='instructor'||r.phase!=='lobby')return;const defs=Array.isArray(teams)?teams.slice(0,MAX_TEAMS):[];if(defs.length<MIN_TEAMS||defs.length>MAX_TEAMS)return socket.emit('errorMsg','Debes configurar entre 2 y 10 equipos.');const seen=new Set();r.teams=defs.map(d=>{let c=String(d.code||'').trim().toUpperCase()||teamCode();while(seen.has(c))c=teamCode();seen.add(c);return makeTeam({name:d.name,code:c},r.budget)});emitState(r)});
+ socket.on('configure',setup=>{const r=rooms.get(socket.data.room);if(!r||socket.data.role!=='instructor'||r.phase!=='lobby')return;r.activityName=clean(setup.activityName||r.activityName,100);r.budget=Math.max(1,Number(setup.budget)||r.budget);r.minIncrement=Math.max(1,Number(setup.minIncrement)||r.minIncrement);r.lotDuration=Math.max(15,Number(setup.lotDuration)||r.lotDuration);r.noConsecutive=!!setup.noConsecutive;r.lots=normalizeLots(setup.lots||r.lots);r.teams.forEach(t=>{t.balance=r.budget;t.invested=0;t.wins=0;t.needs=[];t.reflections=[];t.authenticated=false;t.connected=false});emitState(r)});
+ socket.on('start',()=>{const r=rooms.get(socket.data.room);if(!r||socket.data.role!=='instructor')return;if(r.teams.length<MIN_TEAMS||r.teams.length>MAX_TEAMS||!r.teams.every(t=>t.authenticated))return socket.emit('errorMsg','Se requieren mínimo 2 equipos y todos deben estar autenticados.');r.currentLot=-1;r.phase='between';emitState(r);startLot(r)});
+ socket.on('nextLot',()=>{const r=rooms.get(socket.data.room);if(!r||socket.data.role!=='instructor')return;if(r.phase==='justification')return socket.emit('errorMsg','Espera a que termine o se guarde la justificación.');if(r.phase==='between')startLot(r)});
+ socket.on('placeBid',({amount})=>{const r=rooms.get(socket.data.room);if(!r||socket.data.role!=='team'||r.phase!=='auction')return;const t=r.teams.find(x=>x.id===socket.data.teamId),lot=r.lots[r.currentLot];if(!t||!lot)return;const v=Number(amount),min=r.currentBid?r.currentBid+r.minIncrement:lot.start;if(!Number.isFinite(v)||v<min)return socket.emit('errorMsg',`La puja mínima válida es ${min.toLocaleString('es-CO')}.`);if(v>t.balance)return socket.emit('errorMsg','No puedes pujar por encima de tu saldo disponible.');if(r.noConsecutive&&r.currentBidderId===t.id)return socket.emit('errorMsg','No se permiten pujas consecutivas de un mismo equipo.');r.currentBid=v;r.currentBidderId=t.id;r.bids.push({teamId:t.id,teamName:t.name,amount:v,at:Date.now()});emitState(r)});
+ socket.on('endLot',()=>{const r=rooms.get(socket.data.room);if(r&&socket.data.role==='instructor')awardAndJustify(r)});
+ socket.on('saveJustification',({text})=>{const r=rooms.get(socket.data.room);if(!r||socket.data.role!=='team'||r.phase!=='justification')return;const p=r.pendingJustification;if(!p||p.teamId!==socket.data.teamId)return socket.emit('errorMsg','Este equipo no tiene una justificación pendiente.');if(Date.now()>p.deadline)return autoCloseJustification(r);const t=r.teams.find(x=>x.id===p.teamId),n=t?.needs.find(x=>x.lotId===p.lotId);if(!n)return;n.justification=String(text??'').trim();n.justificationAt=Date.now();const a=r.awarded.find(x=>x.lotId===p.lotId&&x.teamId===p.teamId);if(a)a.justification=n.justification;r.pendingJustification=null;clearRoomTimer(r);r.phase='between';emitState(r);socket.emit('justificationSaved')});
+ socket.on('saveReflections',({reflections})=>{const r=rooms.get(socket.data.room);if(!r||socket.data.role!=='team')return;const t=r.teams.find(x=>x.id===socket.data.teamId);if(!t)return;t.reflections=Array.isArray(reflections)?reflections.map(x=>clean(x,10000)):[];emitState(r)});
+ socket.on('finishSimulation',()=>{const r=rooms.get(socket.data.room);if(!r||socket.data.role!=='instructor')return;if(r.phase==='justification')return socket.emit('errorMsg','Aún hay una justificación pendiente.');clearRoomTimer(r);r.lotEndsAt=null;r.phase='finished';emitState(r)});
+ socket.on('disconnect',()=>{const r=rooms.get(socket.data.room);if(!r)return;if(socket.data.role==='team'){const t=r.teams.find(x=>x.id===socket.data.teamId);if(t){t.connected=false;t.socketId=null;emitState(r)}}else if(socket.data.role==='instructor'){r.instructorId=null}});
 });
-
-function csvEscape(v) {
-  const s=String(v??"").replace(/"/g,'""');
-  return `"${s}"`;
-}
-app.get("/api/room/:code/export", (req,res)=>{
-  const r=rooms.get(req.params.code.toUpperCase());
-  if(!r) return res.status(404).send("Sala no encontrada");
-  const rows=[["Equipo","Código","Necesidad","Valor adjudicado","Saldo final","% presupuesto usado","Justificación"]];
-  r.teams.forEach(t=>{
-    const pct=r.budget?((t.invested/r.budget)*100).toFixed(2):"0.00";
-    if(!t.needs.length) rows.push([t.name,t.code,"","","",pct,""]);
-    else t.needs.forEach(n=>rows.push([t.name,t.code,n.name,n.value,t.balance,pct,n.justification]));
-  });
-  res.setHeader("Content-Type","text/csv; charset=utf-8");
-  res.setHeader("Content-Disposition",`attachment; filename="olla_fortuna_${r.code}.csv"`);
-  res.send("\ufeff"+rows.map(row=>row.map(csvEscape).join(",")).join("\n"));
-});
-
-app.get("*", (_req,res)=>res.sendFile(path.join(__dirname,"public","index.html")));
-
-server.listen(PORT,"0.0.0.0",()=>console.log(`La Olla de la Fortuna V2 escuchando en ${PORT}`));
+server.listen(PORT,'0.0.0.0',()=>console.log(`La Olla de la Fortuna V3 escuchando en ${PORT}`));
